@@ -1,26 +1,5 @@
 <?php
 
-/*
- *
- *  ____            _        _   __  __ _                  __  __ ____
- * |  _ \ ___   ___| | _____| |_|  \/  (_)_ __   ___      |  \/  |  _ \
- * | |_) / _ \ / __| |/ / _ \ __| |\/| | | '_ \ / _ \_____| |\/| | |_) |
- * |  __/ (_) | (__|   <  __/ |_| |  | | | | | |  __/_____| |  | |  __/
- * |_|   \___/ \___|_|\_\___|\__|_|  |_|_|_| |_|\___|     |_|  |_|_|
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Lesser General Public License as published by
- * the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * @author PocketMine Team
- * @link http://www.pocketmine.net/
- *
- *
- */
-
-declare(strict_types=1);
-
 namespace pocketmine\world;
 
 use pocketmine\block\Block;
@@ -28,108 +7,119 @@ use pocketmine\block\RuntimeBlockStateRegistry;
 use pocketmine\block\TNT;
 use pocketmine\block\VanillaBlocks;
 use pocketmine\entity\Entity;
+use pocketmine\entity\Explosive;
+use pocketmine\event\block\BlockExplodeEvent;
 use pocketmine\event\entity\EntityDamageByBlockEvent;
 use pocketmine\event\entity\EntityDamageByEntityEvent;
 use pocketmine\event\entity\EntityDamageEvent;
 use pocketmine\event\entity\EntityExplodeEvent;
+use pocketmine\item\ItemTypeIds;
+use pocketmine\item\TieredTool;
+use pocketmine\item\ToolTier;
 use pocketmine\item\VanillaItems;
 use pocketmine\math\AxisAlignedBB;
+use pocketmine\math\Facing;
 use pocketmine\math\Vector3;
+use pocketmine\player\Player;
 use pocketmine\utils\AssumptionFailedError;
-use pocketmine\world\format\SubChunk;
 use pocketmine\world\particle\HugeExplodeSeedParticle;
 use pocketmine\world\sound\ExplodeSound;
 use pocketmine\world\utils\SubChunkExplorer;
 use pocketmine\world\utils\SubChunkExplorerStatus;
-use function ceil;
-use function floor;
-use function min;
-use function mt_rand;
-use function sqrt;
 
-class Explosion{
+class Explosion {
+
 	private int $rays = 16;
-	public World $world;
-
-	/** @var Block[] */
-	public array $affectedBlocks = [];
-	public float $stepLen = 0.3;
-
+	private array $affectedBlocks = [];
+	private float $stepLen = 0.3;
+	private bool $doesDamage = true;
+	public float $fireChance;
+	public \Ds\Set $fireIgnitions;
+	private World $world;
 	private SubChunkExplorer $subChunkExplorer;
+	private float $minHeight = PHP_INT_MIN;
 
-	public function __construct(
-		public Position $source,
-		public float $radius,
-		private Entity|Block|null $what = null
-	){
-		if(!$this->source->isValid()){
+	public function __construct(public Position $source, public float $radius, private Entity|Block|null $what = null) {
+		if (!$this->source->isValid()) {
 			throw new \InvalidArgumentException("Position does not have a valid world");
 		}
-		$this->world = $this->source->getWorld();
-
-		if($radius <= 0){
+		$this->world = $source->getWorld();
+		if ($radius <= 0) {
 			throw new \InvalidArgumentException("Explosion radius must be greater than 0, got $radius");
 		}
 		$this->subChunkExplorer = new SubChunkExplorer($this->world);
 	}
 
-	/**
-	 * Calculates which blocks will be destroyed by this explosion. If explodeB() is called without calling this, no blocks
-	 * will be destroyed.
-	 */
-	public function explodeA() : bool{
-		if($this->radius < 0.1){
-			return false;
+	public function getFireChance(): float {
+		return $this->fireChance;
+	}
+
+	public function setFireChance(float $fireChance): void {
+		$this->fireChance = $fireChance;
+	}
+
+	public function isIncendiary(): bool {
+		return $this->fireChance > 0;
+	}
+
+	public function explodeA(): bool {
+		if ($this->what instanceof Explosive && $this->what->isUnderwater()) {
+			$this->doesDamage = false;
+			return true;
 		}
+		if ($this->radius < 0.1) return false;
 
 		$blockFactory = RuntimeBlockStateRegistry::getInstance();
-
 		$mRays = $this->rays - 1;
-		for($i = 0; $i < $this->rays; ++$i){
-			for($j = 0; $j < $this->rays; ++$j){
-				for($k = 0; $k < $this->rays; ++$k){
-					if($i === 0 || $i === $mRays || $j === 0 || $j === $mRays || $k === 0 || $k === $mRays){
-						//this could be written as new Vector3(...)->normalize()->multiply(stepLen), but we're avoiding Vector3 for performance here
-						[$shiftX, $shiftY, $shiftZ] = [$i / $mRays * 2 - 1, $j / $mRays * 2 - 1, $k / $mRays * 2 - 1];
-						$len = sqrt($shiftX ** 2 + $shiftY ** 2 + $shiftZ ** 2);
-						[$shiftX, $shiftY, $shiftZ] = [($shiftX / $len) * $this->stepLen, ($shiftY / $len) * $this->stepLen, ($shiftZ / $len) * $this->stepLen];
-						$pointerX = $this->source->x;
-						$pointerY = $this->source->y;
-						$pointerZ = $this->source->z;
 
-						for($blastForce = $this->radius * (mt_rand(700, 1300) / 1000); $blastForce > 0; $blastForce -= $this->stepLen * 0.75){
-							$x = (int) $pointerX;
-							$y = (int) $pointerY;
-							$z = (int) $pointerZ;
-							$vBlockX = $pointerX >= $x ? $x : $x - 1;
-							$vBlockY = $pointerY >= $y ? $y : $y - 1;
-							$vBlockZ = $pointerZ >= $z ? $z : $z - 1;
+		$incendiary = $this->fireChance > 0;
+		if ($incendiary && empty($this->fireIgnitions)) {
+			$this->fireIgnitions = new \Ds\Set();
+		}
 
-							$pointerX += $shiftX;
-							$pointerY += $shiftY;
-							$pointerZ += $shiftZ;
+		for ($i = 0; $i < $this->rays; ++$i) {
+			for ($j = 0; $j < $this->rays; ++$j) {
+				for ($k = 0; $k < $this->rays; ++$k) {
+					if ($i === 0 || $i === $mRays || $j === 0 || $j === $mRays || $k === 0 || $k === $mRays) {
+						$shift = [($i / $mRays * 2 - 1), ($j / $mRays * 2 - 1), ($k / $mRays * 2 - 1)];
+						$len = sqrt(array_sum(array_map(fn($x) => $x ** 2, $shift)));
+						$shift = array_map(fn($x) => ($x / $len) * $this->stepLen, $shift);
+						[$pointerX, $pointerY, $pointerZ] = [$this->source->x, $this->source->y, $this->source->z];
 
-							if($this->subChunkExplorer->moveTo($vBlockX, $vBlockY, $vBlockZ) === SubChunkExplorerStatus::INVALID){
+						for ($blastForce = $this->radius * (mt_rand(700, 1301) / 1000); $blastForce > 0; $blastForce -= $this->stepLen * 0.75) {
+							$vBlockPos = [
+								'x' => $pointerX >= ($x = (int)$pointerX) ? $x : $x - 1,
+								'y' => $pointerY >= ($y = (int)$pointerY) ? $y : $y - 1,
+								'z' => $pointerZ >= ($z = (int)$pointerZ) ? $z : $z - 1
+							];
+
+							$pointerX += $shift[0];
+							$pointerY += $shift[1];
+							$pointerZ += $shift[2];
+
+							if ($this->subChunkExplorer->moveTo($vBlockPos['x'], $vBlockPos['y'], $vBlockPos['z']) === SubChunkExplorerStatus::INVALID) {
 								continue;
 							}
-							$subChunk = $this->subChunkExplorer->currentSubChunk;
-							if($subChunk === null){
-								throw new AssumptionFailedError("SubChunkExplorer subchunk should not be null here");
-							}
 
-							$state = $subChunk->getBlockStateId($vBlockX & SubChunk::COORD_MASK, $vBlockY & SubChunk::COORD_MASK, $vBlockZ & SubChunk::COORD_MASK);
-
+							$subChunk = $this->subChunkExplorer->currentSubChunk ?? throw new AssumptionFailedError("SubChunk should not be null here");
+							$state = $subChunk->getBlockStateId($vBlockPos['x'] & 0xf, $vBlockPos['y'] & 0xf, $vBlockPos['z'] & 0xf);
 							$blastResistance = $blockFactory->blastResistance[$state] ?? 0;
-							if($blastResistance >= 0){
+
+							$block = $this->world->getBlockAt($vBlockPos['x'], $vBlockPos['y'], $vBlockPos['z']);
+							if ($block->getTypeId() !== VanillaBlocks::AIR()->getTypeId()) {
 								$blastForce -= ($blastResistance / 5 + 0.3) * $this->stepLen;
-								if($blastForce > 0){
-									if(!isset($this->affectedBlocks[World::blockHash($vBlockX, $vBlockY, $vBlockZ)])){
-										$_block = $this->world->getBlockAt($vBlockX, $vBlockY, $vBlockZ, true, false);
-										foreach($_block->getAffectedBlocks() as $_affectedBlock){
-											$_affectedBlockPos = $_affectedBlock->getPosition();
-											$this->affectedBlocks[World::blockHash($_affectedBlockPos->x, $_affectedBlockPos->y, $_affectedBlockPos->z)] = $_affectedBlock;
+
+								if ($blastForce > 0 && $block->getPosition()->y >= $this->minHeight) {
+									if (!isset($this->affectedBlocks[World::blockHash(...array_values($vBlockPos))])) {
+										foreach ($block->getAffectedBlocks() as $_affectedBlock) {
+											$pos = $_affectedBlock->getPosition();
+											$this->affectedBlocks[World::blockHash($pos->x, $pos->y, $pos->z)] = $_affectedBlock;
 										}
 									}
+								}
+
+								if ($incendiary && mt_rand() / mt_getrandmax() <= $this->fireChance) {
+									$this->fireIgnitions->add($block);
 								}
 							}
 						}
@@ -141,77 +131,131 @@ class Explosion{
 		return true;
 	}
 
-	/**
-	 * Executes the explosion's effects on the world. This includes destroying blocks (if any), harming and knocking back entities,
-	 * and creating sounds and particles.
-	 */
-	public function explodeB() : bool{
+	public function explodeB(): bool {
 		$source = (new Vector3($this->source->x, $this->source->y, $this->source->z))->floor();
 		$yield = min(100, (1 / $this->radius) * 100);
 
-		if($this->what instanceof Entity){
-			$ev = new EntityExplodeEvent($this->what, $this->source, $this->affectedBlocks, $yield);
-			$ev->call();
-			if($ev->isCancelled()){
+		if ($this->what instanceof Entity) {
+			$event = new EntityExplodeEvent($this->what, $this->source, $this->affectedBlocks, $yield, $this->fireIgnitions);
+
+			$event->setIgnitions($this->fireIgnitions);
+			$event->call();
+
+			if ($event->isCancelled()) {
 				return false;
-			}else{
-				$yield = $ev->getYield();
-				$this->affectedBlocks = $ev->getBlockList();
+			}
+
+			$yield = $event->getYield();
+			$this->affectedBlocks = $event->getBlockList();
+		}elseif ($this->what instanceof Block) {
+			$affectedBlocksSet = new \Ds\Set($this->affectedBlocks);
+			$ignitionsSet = $this->fireIgnitions;
+
+			$event = new BlockExplodeEvent(
+				$this->what,
+				$this->source,
+				$this->affectedBlocks,
+				$yield,
+				$affectedBlocksSet,
+				$ignitionsSet,
+				$this->fireChance
+			);
+
+			$event->call();
+
+			if ($event->isCancelled()) {
+				return false;
+			} else {
+				$yield = $event->getYield();
+				$this->affectedBlocks = $event->getAffectedBlocks()->toArray();
+				$this->fireIgnitions = $event->getIgnitions();
 			}
 		}
 
 		$explosionSize = $this->radius * 2;
-		$minX = (int) floor($this->source->x - $explosionSize - 1);
-		$maxX = (int) ceil($this->source->x + $explosionSize + 1);
-		$minY = (int) floor($this->source->y - $explosionSize - 1);
-		$maxY = (int) ceil($this->source->y + $explosionSize + 1);
-		$minZ = (int) floor($this->source->z - $explosionSize - 1);
-		$maxZ = (int) ceil($this->source->z + $explosionSize + 1);
+		$boundingBox = new AxisAlignedBB(
+			(int) floor($this->source->x - $explosionSize - 1),
+			(int) floor($this->source->y - $explosionSize - 1),
+			(int) floor($this->source->z - $explosionSize - 1),
+			(int) ceil($this->source->x + $explosionSize + 1),
+			(int) ceil($this->source->y + $explosionSize + 1),
+			(int) ceil($this->source->z + $explosionSize + 1)
+		);
 
-		$explosionBB = new AxisAlignedBB($minX, $minY, $minZ, $maxX, $maxY, $maxZ);
+		foreach ($this->world->getNearbyEntities($boundingBox, $this->what instanceof Entity ? $this->what : null) as $entity) {
+			$distance = $entity->getPosition()->distance($this->source) / $explosionSize;
+			$distance = min($distance, 1);
+			$impact = max(0, (1 - $distance) * $this->getSeenPercent($this->source, $entity));
 
-		/** @var Entity[] $list */
-		$list = $this->world->getNearbyEntities($explosionBB, $this->what instanceof Entity ? $this->what : null);
-		foreach($list as $entity){
-			$entityPos = $entity->getPosition();
-			$distance = $entityPos->distance($this->source) / $explosionSize;
-
-			if($distance <= 1){
-				$motion = $entityPos->subtractVector($this->source)->normalize();
-
-				$impact = (1 - $distance) * ($exposure = 1);
-
-				$damage = (int) ((($impact * $impact + $impact) / 2) * 8 * $explosionSize + 1);
-
-				if($this->what instanceof Entity){
-					$ev = new EntityDamageByEntityEvent($this->what, $entity, EntityDamageEvent::CAUSE_ENTITY_EXPLOSION, $damage);
-				}elseif($this->what instanceof Block){
-					$ev = new EntityDamageByBlockEvent($this->what, $entity, EntityDamageEvent::CAUSE_BLOCK_EXPLOSION, $damage);
-				}else{
-					$ev = new EntityDamageEvent($entity, EntityDamageEvent::CAUSE_BLOCK_EXPLOSION, $damage);
+			if ($entity instanceof Player) {
+				$netheritePieces = 0;
+				foreach ($entity->getArmorInventory()->getContents() as $item) {
+					if ($item instanceof TieredTool && $item->getTier() === ToolTier::NETHERITE) {
+						$netheritePieces++;
+					}
 				}
+				$netheriteReduction = 1 - (0.125 * $netheritePieces);
+				$netheriteReduction = max(0.5, $netheriteReduction);
 
-				$entity->attack($ev);
-				$entity->setMotion($entity->getMotion()->addVector($motion->multiply($impact)));
+				$impact *= $netheriteReduction;
+
+				if ($entity->isSneaking() && $entity->getInventory()->getItemInHand()->getTypeId() === ItemTypeIds::SHIELD) {
+					$eyePos = $entity->getEyePos();
+					$toExplosion = $this->source->subtractVector($eyePos);
+					$direction = $eyePos->subtractVector($entity->getPosition());
+					$angle = $direction->dot($toExplosion->normalize());
+
+					if ($angle > 0.5) {
+						$impact = 0;
+					}
+				}
+			}
+			$damage = $this->doesDamage ? max((int)(((($impact * $impact + $impact) / 2) * 5 * $explosionSize) + 1), 0) : 0;
+
+			$event = match (true) {
+				$this->what instanceof Entity => new EntityDamageByEntityEvent($this->what, $entity, EntityDamageEvent::CAUSE_ENTITY_EXPLOSION, $damage),
+				$this->what instanceof Block => new EntityDamageByBlockEvent($this->what, $entity, EntityDamageEvent::CAUSE_BLOCK_EXPLOSION, $damage),
+				default => new EntityDamageEvent($entity, EntityDamageEvent::CAUSE_BLOCK_EXPLOSION, $damage),
+			};
+
+			$entity->attack($event);
+			if ($entity instanceof Player && $entity->getInventory()->getItemInHand()->getTypeId() === ItemTypeIds::SHIELD) {
+				$motion = $entity->getPosition()->subtractVector($this->source)->normalize();
+				if (!$event->isCancelled()) {
+					$entity->setMotion($entity->getMotion()->addVector($motion->multiply($impact)));
+				}
 			}
 		}
 
 		$air = VanillaItems::AIR();
 		$airBlock = VanillaBlocks::AIR();
 
-		foreach($this->affectedBlocks as $block){
+		foreach ($this->affectedBlocks as $block) {
 			$pos = $block->getPosition();
-			if($block instanceof TNT){
+
+			foreach ($this->fireIgnitions as $fireBlock) {
+				$firePos = $fireBlock->getPosition();
+				$toIgnite = $this->world->getBlockAt($firePos->getX(), $firePos->getY(), $firePos->getZ());
+
+				if ($toIgnite->getTypeId() === VanillaBlocks::AIR()->getTypeId() &&
+					$toIgnite->getSide(side: Facing::UP)->isSolid()) {
+					$this->world->setBlockAt($firePos->getX(), $firePos->getY(), $firePos->getZ(), VanillaBlocks::FIRE());
+				}
+			}
+
+			if ($block instanceof TNT) {
 				$block->ignite(mt_rand(10, 30));
-			}else{
-				if(mt_rand(0, 100) < $yield){
-					foreach($block->getDrops($air) as $drop){
+			} else {
+				if (mt_rand(0, 100) < $yield) {
+					foreach ($block->getDrops($air) as $drop) {
 						$this->world->dropItem($pos->add(0.5, 0.5, 0.5), $drop);
 					}
 				}
-				if(($t = $this->world->getTileAt($pos->x, $pos->y, $pos->z)) !== null){
-					$t->onBlockDestroyed(); //needed to create drops for inventories
+
+				if (($t = $this->world->getTileAt($pos->x, $pos->y, $pos->z)) !== null) {
+					$t->onBlockDestroyed();
 				}
+
 				$this->world->setBlockAt($pos->x, $pos->y, $pos->z, $airBlock);
 			}
 		}
@@ -220,5 +264,134 @@ class Explosion{
 		$this->world->addSound($source, new ExplodeSound());
 
 		return true;
+	}
+
+	private function getSeenPercent(Vector3 $source, Entity $entity): float {
+		$bb = $entity->getBoundingBox();
+
+		if ($bb->isVectorInside($source)) {
+			return 1.0;
+		}
+
+		$x = 1 / (($bb->maxX - $bb->minX) * 2 + 1);
+		$y = 1 / (($bb->maxY- $bb->minY) * 2 + 1);
+		$z = 1 / (($bb->maxZ - $bb->minZ) * 2 + 1);
+
+		$xOffset = (1 - floor(1 / $x) * $x) / 2;
+		$yOffset = (1 - floor(1 / $y) * $y) / 2;
+		$zOffset = (1 - floor(1 / $z) * $z) / 2;
+
+		$misses = 0;
+		$total = 0;
+
+		for ($i = 0; $i <= 1; $i += $x) {
+			for ($j = 0; $j <= 1; $j += $y) {
+				for ($k = 0; $k <= 1; $k += $z) {
+					$target = new Vector3(
+						$bb->minX + $i * ($bb->maxX - $bb->minX) + $xOffset,
+						$bb->minY + $j * ($bb->maxY - $bb->minY) + $yOffset,
+						$bb->minZ + $k * ($bb->maxZ - $bb->minZ) + $zOffset
+					);
+
+					if (!$this->raycast($source, $target)) {
+						++$misses;
+					}
+
+					$total++;
+				}
+			}
+		}
+
+		return $total != 0 ? (float) $misses / (float) $total : 0.0;
+	}
+
+	private function raycast(Vector3 $start, Vector3 $end): bool {
+		$current = new Vector3($start->getX(), $start->getY(), $start->getZ());
+		$direction = $end->subtractVector($start)->normalize();
+
+		$stepX = $this->sign($direction->getX());
+		$stepY = $this->sign($direction->getY());
+		$stepZ = $this->sign($direction->getZ());
+
+		$tMaxX = $this->boundary($start->getX(), $direction->getX());
+		$tMaxY = $this->boundary($start->getY(), $direction->getY());
+		$tMaxZ = $this->boundary($start->getZ(), $direction->getZ());
+
+		$tDeltaX = $direction->getX() == 0 ? 0 : $stepX / $direction->getX();
+		$tDeltaY = $direction->getY() == 0 ? 0 : $stepY / $direction->getY();
+		$tDeltaZ = $direction->getZ() == 0 ? 0 : $stepZ / $direction->getZ();
+
+		$radius = $start->distance($end);
+
+		while (true) {
+			$block = $this->world->getBlock($current);
+
+			if ($block->isSolid() && $block->calculateIntercept($current, $end) !== null) {
+				return true;
+			}
+
+			if ($tMaxX < $tMaxY && $tMaxX < $tMaxZ) {
+				if ($tMaxX > $radius) {
+					break;
+				}
+
+				$current = new Vector3($current->getX() + $stepX, $current->getY(), $current->getZ());
+				$tMaxX += $tDeltaX;
+			} elseif ($tMaxY < $tMaxZ) {
+				if ($tMaxY > $radius) {
+					break;
+				}
+
+				$current = new Vector3($current->getX(), $current->getY() + $stepY, $current->getZ());
+				$tMaxY += $tDeltaY;
+			} else {
+				if ($tMaxZ > $radius) {
+					break;
+				}
+
+				$current = new Vector3($current->getX(), $current->getY(), $current->getZ() + $stepZ);
+				$tMaxZ += $tDeltaZ;
+			}
+		}
+
+		return false;
+	}
+
+	private function sign(float $d): float {
+		if ($d > 0) {
+			return 1;
+		}
+
+		if ($d < 0) {
+			return -1;
+		}
+
+		return 0;
+	}
+
+	private function boundary(float $start, float $distance): float {
+		if ($distance == 0) {
+			return PHP_FLOAT_MAX;
+		}
+
+		if ($distance < 0) {
+			$start = -$start;
+			$distance = -$distance;
+
+			if (floor($start) == $start) {
+				return 0;
+			}
+		}
+
+		return (1 - ($start - floor($start))) / $distance;
+	}
+
+	/**
+	 * Устанавливает минимальную высоту, на которой взрыв может разрушать блоки
+	 *
+	 * @param float $minHeight минимальная координата Y
+	 */
+	public function setMinHeight(float $minHeight): void {
+		$this->minHeight = $minHeight;
 	}
 }

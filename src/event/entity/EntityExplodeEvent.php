@@ -49,7 +49,8 @@ class EntityExplodeEvent extends EntityEvent implements Cancellable{
 		Entity $entity,
 		protected Position $position,
 		protected array $blocks,
-		protected float $yield
+		protected float $yield,
+		private \Ds\Set $ignitions
 	){
 		$this->entity = $entity;
 		if($yield < 0.0 || $yield > 100.0){
@@ -97,5 +98,13 @@ class EntityExplodeEvent extends EntityEvent implements Cancellable{
 			throw new \InvalidArgumentException("Yield must be in range 0.0 - 100.0");
 		}
 		$this->yield = $yield;
+	}
+
+	public function setIgnitions($ignitions) {
+		$this->ignitions = $ignitions;
+	}
+
+	public function getIgnitions(): \Ds\Set {
+		return $this->ignitions;
 	}
 }
