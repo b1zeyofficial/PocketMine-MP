@@ -490,7 +490,7 @@ final class Utils{
 			$rawFrame = $rawTrace[$frameId];
 			$safeTrace[$frameId] = new ThreadCrashInfoFrame(
 				$printableFrame,
-				$rawFrame["file"] ?? "unknown",
+				$rawFrame["file"] ?? null,
 				$rawFrame["line"] ?? 0
 			);
 		}
